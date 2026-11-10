@@ -1,5 +1,10 @@
 export type RiskFlag = "low" | "medium" | "high" | "critical";
 
+export interface GeoJSONGeometry {
+  type: "Polygon" | "MultiPolygon";
+  coordinates: number[][][] | number[][][][];
+}
+
 export interface Project {
   id: number;
   verra_id: string;
@@ -16,6 +21,7 @@ export interface Claim {
   project_id: number;
   coordinates_raw: string | null;
   geometry_wkt: string | null;
+  boundary_geojson?: GeoJSONGeometry | null;
   geocoding_method: string | null;
   claimed_hectares: number | null;
   start_year: number | null;
@@ -45,6 +51,10 @@ export interface Verification {
   decline_detected_since: string | null;
   likely_cause: string | null;
   fire_events_detected: number | null;
+  tree_cover_ha?: number | null;
+  aoi_ha?: number | null;
+  forest_loss_ha?: number | null;
+  fire_dates?: { dates: string[] } | null;
   estimated_biomass_tha: number | null;
   estimated_tco2: number | null;
   estimated_tco2_low: number | null;
@@ -85,4 +95,5 @@ export interface ScoreListItem {
   status: string;
   composite_score: number | null;
   risk_flag: RiskFlag | null;
+  geometry_wkt?: string | null;
 }
