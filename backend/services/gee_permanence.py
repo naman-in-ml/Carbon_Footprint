@@ -1,90 +1,114 @@
 """Stage 3: permanence check — NDVI time series + NASA FIRMS fire events."""
-import csv
-import io
 from datetime import datetime
 
-import httpx
 import ee
 
-from core.config import settings
 from services._gee_init import init_gee
+from services.gee_common import mean_ndvi
 
 
-def compute_ndvi_time_series(lat: float, lon: float, start_year: int, buffer_m: int = 5000) -> dict:
-    init_gee()
-    point = ee.Geometry.Point([lon, lat])
-    polygon = point.buffer(buffer_m)
-    current_year = datetime.utcnow().year
-    years = list(range(start_year, current_year + 1))
+def confidence_is_usable(value: str | int | float | None) -> bool:
+    """Accept nominal/high categorical confidence or numeric confidence >= 50."""
+    if isinstance(value, str):
+        return value.lower() in {"n", "h"}
+    if isinstance(value, bool) or value is None:
+        return False
+    return value >= 50
 
-    time_series = {}
-    for year in years:
-        collection = (
-            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-            .filterBounds(polygon)
-            .filterDate(f"{year}-01-01", f"{year}-12-31")
-            .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
-            .map(lambda img: img.normalizedDifference(["B8", "B4"]).rename("NDVI"))
-        )
-        mean_image = collection.mean()
-        stats = mean_image.reduceRegion(
-            reducer=ee.Reducer.mean(),
-            geometry=polygon,
-            scale=10,
-            maxPixels=1e9,
-        ).getInfo()
-        time_series[str(year)] = round(stats.get("NDVI") or 0, 4)
 
-    ndvi_values = list(time_series.values())
-    years_list = list(time_series.keys())
-
+def classify_permanence(time_series: dict[str, float]) -> dict:
+    """Classify whether vegetation remains from a pure NDVI time series."""
+    years = list(time_series)
+    values = list(time_series.values())
+    current_ndvi = values[-1] if values else None
+    if current_ndvi is None:
+        return {
+            "ndvi_current": None,
+            "still_standing": "unknown",
+            "decline_detected_since": None,
+        }
     decline_year = None
-    for i in range(1, len(ndvi_values)):
-        if (ndvi_values[i - 1] or 0) - (ndvi_values[i] or 0) > 0.10:
-            decline_year = years_list[i]
+    for index in range(1, len(values)):
+        if values[index - 1] - values[index] > 0.10:
+            decline_year = years[index]
             break
-
-    current_ndvi = ndvi_values[-1] if ndvi_values else None
     still_standing = "yes"
     if decline_year:
-        still_standing = "no" if (current_ndvi < 0.25) else "partial"
-
+        still_standing = "no" if current_ndvi < 0.25 else "partial"
     return {
-        "ndvi_time_series": time_series,
         "ndvi_current": current_ndvi,
         "still_standing": still_standing,
         "decline_detected_since": decline_year,
     }
 
 
-async def check_fire_events(lat: float, lon: float, start_year: int) -> dict:
-    end_date = datetime.utcnow().strftime("%Y-%m-%d")
-    url = (
-        f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/"
-        f"{settings.firms_map_key}/VIIRS_SNPP_NRT/"
-        f"{lon - 0.1},{lat - 0.1},{lon + 0.1},{lat + 0.1}/1/{end_date}"
-    )
-    fire_events = []
-    if not settings.firms_map_key:
-        return {"fire_events_detected": 0, "fire_dates": [], "likely_cause": "unclear"}
+def compute_ndvi_time_series(aoi: ee.Geometry, start_year: int) -> dict:
+    """Fetch one server-side dictionary for all annual NDVI values."""
+    init_gee()
+    current_year = datetime.utcnow().year
+    years = range(start_year, current_year + 1)
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(url)
-            if resp.status_code == 200 and resp.text.strip():
-                # csv.DictReader — the CSV contains quoted fields with commas.
-                reader = csv.DictReader(io.StringIO(resp.text))
-                for row in reader:
-                    fire_events.append(
-                        {
-                            "date": row.get("acq_date"),
-                            "confidence": row.get("confidence"),
-                            "frp": row.get("frp"),
-                        }
-                    )
-    except Exception:
-        pass
-    return {
-        "fire_events_detected": len(fire_events),
-        "fire_dates": [e["date"] for e in fire_events],
-        "likely_cause": "fire" if fire_events else "unclear",
-    }
+        raw = ee.Dictionary(
+            {str(year): mean_ndvi(aoi, year) for year in years}
+        ).getInfo()
+        time_series = {
+            year: round(value, 4)
+            for year, value in raw.items()
+            if value is not None and value >= -0.5
+        }
+        return {"ndvi_time_series": time_series, **classify_permanence(time_series)}
+    except Exception as exc:
+        return {
+            "ndvi_time_series": {},
+            **classify_permanence({}),
+            "error": str(exc),
+        }
+
+
+def check_fire_events(aoi: ee.Geometry, start_year: int) -> dict:
+    """Distinct fire-detection days inside the AOI since project start (NASA FIRMS in GEE)."""
+    init_gee()
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    try:
+        collection = (
+            ee.ImageCollection("FIRMS")
+            .filterBounds(aoi)
+            .filterDate(f"{start_year}-01-01", today)
+        )
+
+        def image_to_feature(img):
+            confident_fire = img.select("T21").updateMask(
+                img.select("confidence").gte(50)
+            )
+            count = confident_fire.reduceRegion(
+                ee.Reducer.count(),
+                aoi,
+                1000,
+                maxPixels=1e9,
+                bestEffort=True,
+            ).get("T21")
+            return ee.Feature(
+                None,
+                {"date": img.date().format("YYYY-MM-dd"), "n": count},
+            )
+
+        dates = (
+            ee.FeatureCollection(collection.map(image_to_feature))
+            .filter(ee.Filter.gt("n", 0))
+            .aggregate_array("date")
+            .getInfo()
+        )
+        unique_dates = sorted(set(dates))
+        return {
+            "fire_events_detected": len(unique_dates),
+            "fire_dates": unique_dates,
+            "likely_cause": "fire" if unique_dates else "unclear",
+            "source": "NASA FIRMS (GEE)",
+        }
+    except Exception as exc:
+        return {
+            "fire_events_detected": 0,
+            "fire_dates": [],
+            "likely_cause": "unclear",
+            "error": str(exc),
+        }

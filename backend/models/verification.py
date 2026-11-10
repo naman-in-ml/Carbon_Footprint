@@ -27,6 +27,9 @@ class SatelliteVerification(SQLModel, table=True):
     estimated_tco2: Optional[float] = None
     estimated_tco2_low: Optional[float] = None
     estimated_tco2_high: Optional[float] = None
+    tree_cover_ha: Optional[float] = None
+    aoi_ha: Optional[float] = None
+    forest_loss_ha: Optional[float] = None
     credit_delta_pct: Optional[float] = None
     credit_flag: Optional[str] = Field(default=None, max_length=32)
     ndvi_time_series: Optional[dict] = Field(default=None, sa_column=Column(JSONB))

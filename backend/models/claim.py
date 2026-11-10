@@ -12,6 +12,7 @@ class ExtractedClaim(SQLModel, table=True):
     project_id: int = Field(foreign_key="projects.id", index=True)
     coordinates_raw: Optional[str] = Field(default=None, sa_column=Column(Text))
     geometry_wkt: Optional[str] = Field(default=None, sa_column=Column(Text))
+    boundary_geojson: Optional[dict] = Field(default=None, sa_column=Column(JSONB))
     geocoding_method: Optional[str] = Field(default=None, max_length=32)
     claimed_hectares: Optional[float] = None
     start_year: Optional[int] = None

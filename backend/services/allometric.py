@@ -32,7 +32,12 @@ def ndvi_to_canopy_fraction(ndvi: float) -> float:
     return 0.00
 
 
-def estimate_tco2(verified_hectares: float, ndvi_current: float, species_text: str | None) -> dict:
+def estimate_tco2(
+    verified_hectares: float,
+    ndvi_current: float,
+    species_text: str | None,
+    apply_canopy_fraction: bool = True,
+) -> dict:
     species_key = "default"
     if species_text:
         for key in SPECIES_BIOMASS_THA:
@@ -41,7 +46,7 @@ def estimate_tco2(verified_hectares: float, ndvi_current: float, species_text: s
                 break
     biomass_tha = SPECIES_BIOMASS_THA[species_key]
 
-    canopy_fraction = ndvi_to_canopy_fraction(ndvi_current)
+    canopy_fraction = ndvi_to_canopy_fraction(ndvi_current) if apply_canopy_fraction else 1.0
     above_ground = (
         verified_hectares * biomass_tha * canopy_fraction * CARBON_FRACTION * CO2_TO_C_RATIO
     )
@@ -57,6 +62,9 @@ def estimate_tco2(verified_hectares: float, ndvi_current: float, species_text: s
         "high_estimate": round(high, 1),
         "species_used": species_key,
         "canopy_fraction": canopy_fraction,
+        "area_basis": (
+            "claimed_area_ndvi_scaled" if apply_canopy_fraction else "satellite_tree_cover"
+        ),
         "method": "IPCC-2006 allometric + NDVI canopy proxy (order-of-magnitude)",
     }
 

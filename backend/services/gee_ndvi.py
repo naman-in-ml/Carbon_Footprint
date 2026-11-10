@@ -1,80 +1,93 @@
-"""Stage 2: NDVI planting verification on Google Earth Engine.
+"""Stage 2 NDVI verification over a boundary or claim-sized circle.
 
-Control region: we compare against a *spatially separate* buffer placed
-~CONTROL_OFFSET_M away from the project, not an annulus ring around it
-(a project surrounded by similar land would create a false "no difference").
-This is still a screening heuristic — the control region may differ in soil or
-land use, which we flag as a limitation in the returned metadata.
+The control is a same-sized offset region. This is a screening heuristic: its
+soil and land use may differ from the project area.
 """
 import ee
 
 from services._gee_init import init_gee
+from services.gee_common import mean_ndvi
 
-CONTROL_OFFSET_M = 15000
+
+def classify_planting(
+    ndvi_before: float | None,
+    ndvi_after_3yr: float | None,
+    control_before: float | None,
+    control_after_3yr: float | None,
+) -> dict:
+    """Classify planting using project-versus-control difference-in-differences."""
+    if (
+        ndvi_before is None
+        or ndvi_after_3yr is None
+        or control_before is None
+        or control_after_3yr is None
+    ):
+        return {
+            "planting_verified": "unknown",
+            "planting_confidence": 0.3,
+            "ndvi_trend": "unknown",
+        }
+    net_gain = (ndvi_after_3yr - ndvi_before) - (
+        control_after_3yr - control_before
+    )
+    if net_gain > 0.15:
+        return {
+            "planting_verified": "yes",
+            "planting_confidence": min(0.5 + net_gain, 0.95),
+            "ndvi_trend": "rising",
+        }
+    if net_gain > 0.05:
+        return {
+            "planting_verified": "partial",
+            "planting_confidence": 0.4,
+            "ndvi_trend": "rising",
+        }
+    return {
+        "planting_verified": "no",
+        "planting_confidence": 0.2,
+        "ndvi_trend": "flat",
+    }
 
 
-def compute_ndvi_stats(lat: float, lon: float, start_year: int, buffer_m: int = 5000) -> dict:
-    """NDVI before planting, 1 yr after, 3 yr after, plus a separate control region."""
+def _clean_ndvi(value: float | None) -> float | None:
+    if value is None or value < -0.5:
+        return None
+    return round(value, 4)
+
+
+def compute_ndvi_stats(aoi: ee.Geometry, control: ee.Geometry, start_year: int) -> dict:
+    """NDVI before planting, one and three years after, plus an offset control."""
     init_gee()
-    point = ee.Geometry.Point([lon, lat])
-    polygon = point.buffer(buffer_m)
-    # A separate, similar-sized region offset from the project boundary.
-    control_point = ee.Geometry.Point([lon + 0.2, lat + 0.1]).buffer(buffer_m)
-
-    def get_mean_ndvi(geometry, year: int):
-        collection = (
-            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-            .filterBounds(geometry)
-            .filterDate(f"{year}-01-01", f"{year}-12-31")
-            .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
-            .map(lambda img: img.normalizedDifference(["B8", "B4"]).rename("NDVI"))
-        )
-        mean_image = collection.mean()
-        stats = mean_image.reduceRegion(
-            reducer=ee.Reducer.mean(),
-            geometry=geometry,
-            scale=10,
-            maxPixels=1e9,
-        )
-        return stats.getInfo().get("NDVI")
-
-    baseline_year = start_year - 1
     try:
-        ndvi_before = get_mean_ndvi(polygon, baseline_year)
-        ndvi_after_1yr = get_mean_ndvi(polygon, start_year + 1)
-        ndvi_after_3yr = get_mean_ndvi(polygon, start_year + 3)
-        ndvi_control = get_mean_ndvi(control_point, start_year + 1)
+        values = ee.Dictionary(
+            {
+                "before": mean_ndvi(aoi, start_year - 1),
+                "after_1yr": mean_ndvi(aoi, start_year + 1),
+                "after_3yr": mean_ndvi(aoi, start_year + 3),
+                "control_before": mean_ndvi(control, start_year - 1),
+                "control_after_3yr": mean_ndvi(control, start_year + 3),
+            }
+        ).getInfo()
+        before = _clean_ndvi(values.get("before"))
+        after_1yr = _clean_ndvi(values.get("after_1yr"))
+        after_3yr = _clean_ndvi(values.get("after_3yr"))
+        control_before = _clean_ndvi(values.get("control_before"))
+        control_after_3yr = _clean_ndvi(values.get("control_after_3yr"))
+        classification = classify_planting(
+            before, after_3yr, control_before, control_after_3yr
+        )
+        return {
+            "ndvi_before": before,
+            "ndvi_after_1yr": after_1yr,
+            "ndvi_after_3yr": after_3yr,
+            "ndvi_control": control_after_3yr,
+            "ndvi_control_before": control_before,
+            **classification,
+            "control_method": "same_sized_offset_buffer",
+            "control_limitation": (
+                "Control is a spatially separate buffer; land-use similarity "
+                "to the project area is not guaranteed."
+            ),
+        }
     except Exception as exc:
         return {"error": str(exc), "planting_verified": "unknown"}
-
-    delta = (ndvi_after_3yr or 0) - (ndvi_before or 0)
-    control_delta = (ndvi_control or 0) - (ndvi_before or 0)
-    net_gain = delta - control_delta
-
-    if net_gain > 0.15:
-        planting_verified = "yes"
-        planting_confidence = min(0.5 + net_gain, 0.95)
-        ndvi_trend = "rising"
-    elif net_gain > 0.05:
-        planting_verified = "partial"
-        planting_confidence = 0.4
-        ndvi_trend = "rising"
-    else:
-        planting_verified = "no"
-        planting_confidence = 0.2
-        ndvi_trend = "flat"
-
-    return {
-        "ndvi_before": round(ndvi_before or 0, 4),
-        "ndvi_after_1yr": round(ndvi_after_1yr or 0, 4),
-        "ndvi_after_3yr": round(ndvi_after_3yr or 0, 4),
-        "ndvi_control": round(ndvi_control or 0, 4),
-        "ndvi_trend": ndvi_trend,
-        "planting_verified": planting_verified,
-        "planting_confidence": round(planting_confidence, 2),
-        "control_method": f"offset_buffer_{CONTROL_OFFSET_M}m",
-        "control_limitation": (
-            "Control is a spatially separate buffer; land-use similarity "
-            "to the project area is not guaranteed."
-        ),
-    }

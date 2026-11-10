@@ -26,12 +26,37 @@ from models.verification import SatelliteVerification
 from services import nugen
 from services.allometric import estimate_tco2, reconcile_credits
 from services.fallback_parser import extract_claims_fallback
+from services.gee_common import build_aoi, build_control
+from services.gee_landcover import measure_land_cover
 from services.gee_ndvi import compute_ndvi_stats
 from services.gee_permanence import check_fire_events, compute_ndvi_time_series
 from services.geocoder import resolve_geometry
 from services.scorer import compute_composite
 
 logger = logging.getLogger(__name__)
+
+
+def _scale_estimate_for_truncated_aoi(
+    estimate: dict,
+    claimed_hectares: float | None,
+    aoi_hectares: float | None,
+) -> dict:
+    """Extrapolate AOI-limited carbon estimates across the full claimed area."""
+    if (
+        claimed_hectares is None
+        or aoi_hectares is None
+        or aoi_hectares <= 0
+        or claimed_hectares <= aoi_hectares
+    ):
+        return estimate
+
+    factor = claimed_hectares / aoi_hectares
+    scaled = dict(estimate)
+    for key in ("estimated_tco2", "low_estimate", "high_estimate"):
+        value = estimate.get(key)
+        if value is not None:
+            scaled[key] = round(value * factor, 1)
+    return scaled
 
 
 def _has_nugen() -> bool:
@@ -123,18 +148,33 @@ async def run_stage_verify(project: Project, db: AsyncSession) -> SatelliteVerif
     lat, lon = _parse_point_wkt(claim.geometry_wkt)
     start_year = claim.start_year or 2020
 
-    loop = asyncio.get_event_loop()
-    ndvi_stats, ndvi_ts, fire_data = await asyncio.gather(
-        loop.run_in_executor(None, compute_ndvi_stats, lat, lon, start_year),
-        loop.run_in_executor(None, compute_ndvi_time_series, lat, lon, start_year),
-        check_fire_events(lat, lon, start_year),
+    aoi, radius_m = build_aoi(
+        lat, lon, claim.claimed_hectares, claim.boundary_geojson
+    )
+    control = build_control(lat, lon, radius_m)
+
+    loop = asyncio.get_running_loop()
+    ndvi_stats, ndvi_ts, fire_data, land = await asyncio.gather(
+        loop.run_in_executor(None, compute_ndvi_stats, aoi, control, start_year),
+        loop.run_in_executor(None, compute_ndvi_time_series, aoi, start_year),
+        loop.run_in_executor(None, check_fire_events, aoi, start_year),
+        loop.run_in_executor(None, measure_land_cover, aoi, start_year),
     )
 
+    tree_cover_ha = land.get("tree_cover_ha")
     ndvi_current = ndvi_ts.get("ndvi_current") or ndvi_stats.get("ndvi_after_3yr") or 0
-    allometric = estimate_tco2(
-        verified_hectares=claim.claimed_hectares or 100,
+    raw_allometric = estimate_tco2(
+        verified_hectares=(
+            tree_cover_ha if tree_cover_ha is not None else (claim.claimed_hectares or 100)
+        ),
         ndvi_current=ndvi_current,
         species_text=claim.species,
+        apply_canopy_fraction=tree_cover_ha is None,
+    )
+    allometric = _scale_estimate_for_truncated_aoi(
+        raw_allometric,
+        claimed_hectares=claim.claimed_hectares,
+        aoi_hectares=land.get("aoi_ha"),
     )
     credit_reconciliation = reconcile_credits(
         claimed_tco2=claim.claimed_tco2 or 0,
@@ -154,14 +194,19 @@ async def run_stage_verify(project: Project, db: AsyncSession) -> SatelliteVerif
         still_standing=ndvi_ts.get("still_standing"),
         decline_detected_since=ndvi_ts.get("decline_detected_since"),
         fire_events_detected=fire_data.get("fire_events_detected"),
-        fire_dates={"dates": fire_data.get("fire_dates")},
+        fire_dates={"dates": fire_data.get("fire_dates", [])},
         likely_cause=fire_data.get("likely_cause"),
         estimated_biomass_tha=round(
-            allometric.get("estimated_tco2", 0) / max(claim.claimed_hectares or 1, 1), 1
+            raw_allometric.get("estimated_tco2", 0)
+            / max(tree_cover_ha or claim.claimed_hectares or 1, 1),
+            1,
         ),
         estimated_tco2=allometric.get("estimated_tco2"),
         estimated_tco2_low=allometric.get("low_estimate"),
         estimated_tco2_high=allometric.get("high_estimate"),
+        tree_cover_ha=tree_cover_ha,
+        aoi_ha=land.get("aoi_ha"),
+        forest_loss_ha=land.get("forest_loss_ha"),
         credit_delta_pct=credit_reconciliation.get("credit_delta_pct"),
         credit_flag=credit_reconciliation.get("credit_flag"),
         ndvi_time_series=ndvi_ts.get("ndvi_time_series"),
@@ -197,6 +242,10 @@ async def run_stage_score(project: Project, db: AsyncSession) -> CredibilityScor
         fire_events_detected=verif.fire_events_detected or 0,
         decline_detected=bool(verif.decline_detected_since),
         credit_flag=verif.credit_flag,
+        claimed_hectares=claim.claimed_hectares,
+        tree_cover_ha=verif.tree_cover_ha,
+        aoi_ha=verif.aoi_ha,
+        forest_loss_ha=verif.forest_loss_ha,
     )
     score = CredibilityScore(project_id=project.id, verification_id=verif.id, **score_data)
     db.add(score)

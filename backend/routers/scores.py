@@ -18,6 +18,11 @@ async def list_all_scores(db: AsyncSession = Depends(get_db)):
     projects = (await db.execute(select(Project).order_by(Project.id))).scalars().all()
     results = []
     for p in projects:
+        claim = (
+            await db.execute(
+                select(ExtractedClaim).where(ExtractedClaim.project_id == p.id)
+            )
+        ).scalars().first()
         score = (
             await db.execute(
                 select(CredibilityScore).where(CredibilityScore.project_id == p.id)
@@ -33,6 +38,7 @@ async def list_all_scores(db: AsyncSession = Depends(get_db)):
                 "status": p.status,
                 "composite_score": score.composite_score if score else None,
                 "risk_flag": score.risk_flag if score else None,
+                "geometry_wkt": claim.geometry_wkt if claim else None,
             }
         )
     return results
